@@ -1,0 +1,14 @@
+[package]
+name = "dmabuf-example"
+version = "0.1.0"
+edition = "2021"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+vulkano = { git = "https://github.com/vulkano-rs/vulkano", rev = "94f50f1" }
+vulkano-shaders = { git = "https://github.com/vulkano-rs/vulkano", rev = "94f50f1" }
+vulkano-util = { git = "https://github.com/vulkano-rs/vulkano", rev = "94f50f1" }
+vulkano-win = { git = "https://github.com/vulkano-rs/vulkano", rev = "94f50f1" }
+winit = "0.29.10"
+wlx-capture = { git = "https://github.com/galister/wlx-capture" }
