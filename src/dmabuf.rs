@@ -19,7 +19,12 @@ use vulkano::{
     },
     sync::Sharing,
 };
-use wlx_capture::wayland::wayland_client::backend::smallvec::SmallVec;
+use wlx_capture::{
+    frame::{
+        FourCC, DRM_FORMAT_ABGR8888, DRM_FORMAT_ARGB8888, DRM_FORMAT_XBGR8888, DRM_FORMAT_XRGB8888,
+    },
+    wayland::wayland_client::backend::smallvec::SmallVec,
+};
 
 #[cfg(target_os = "linux")]
 /// Struct that contains a Linux file descriptor for importing, when creating an image. Since a file descriptor is used for each
@@ -165,4 +170,14 @@ pub fn image_from_dma_buf_fd(
             })
             .ok()?
     }))
+}
+
+pub fn fourcc_to_vk(fourcc: FourCC) -> Format {
+    match fourcc.value {
+        DRM_FORMAT_ABGR8888 => Format::R8G8B8A8_UNORM,
+        DRM_FORMAT_XBGR8888 => Format::R8G8B8A8_UNORM,
+        DRM_FORMAT_ARGB8888 => Format::B8G8R8A8_UNORM,
+        DRM_FORMAT_XRGB8888 => Format::B8G8R8A8_UNORM,
+        _ => panic!("Unsupported memfd format {}", fourcc),
+    }
 }

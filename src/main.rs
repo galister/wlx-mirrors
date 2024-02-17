@@ -12,11 +12,10 @@ use vulkano::{
         physical::PhysicalDeviceType, Device, DeviceCreateInfo, DeviceExtensions, QueueCreateInfo,
         QueueFlags,
     },
-    format::Format,
     image::{
         sampler::{Filter, Sampler, SamplerAddressMode, SamplerCreateInfo},
         view::ImageView,
-        Image, ImageCreateFlags, ImageUsage,
+        Image, ImageUsage,
     },
     instance::{Instance, InstanceCreateFlags, InstanceCreateInfo},
     memory::allocator::{AllocationCreateInfo, MemoryTypeFilter, StandardMemoryAllocator},
@@ -42,28 +41,28 @@ use vulkano::{
     Validated, VulkanError, VulkanLibrary,
 };
 use winit::{
+    dpi::PhysicalSize,
     event::{Event, WindowEvent},
     event_loop::{ControlFlow, EventLoop},
     window::WindowBuilder,
 };
 use wlx_capture::{
     frame::{
-        WlxFrame, DRM_FORMAT_ABGR8888, DRM_FORMAT_ARGB8888, DRM_FORMAT_XBGR8888,
+        DrmFormat, DRM_FORMAT_ABGR8888, DRM_FORMAT_ARGB8888, DRM_FORMAT_XBGR8888,
         DRM_FORMAT_XRGB8888,
     },
-    wayland::WlxClient,
-    wlr_dmabuf::WlrDmabufCapture,
+    pipewire::{pipewire_select_screen, PipewireCapture},
     WlxCapture,
 };
 
-use crate::dmabuf::{image_from_dma_buf_fd, SubresourceData};
+use crate::dmabuf::fourcc_to_vk;
 
 mod dmabuf;
+mod receiver;
 
 fn main() -> Result<(), impl Error> {
-    // The start of this example is exactly the same as `triangle`. You should read the `triangle`
-    // example if you haven't done so yet.
-    let layers = vec!["VK_LAYER_KHRONOS_validation".to_owned()];
+    //let layers = vec!["VK_LAYER_KHRONOS_validation".to_owned()];
+    let layers = vec![];
 
     let event_loop = EventLoop::new().unwrap();
 
@@ -135,36 +134,6 @@ fn main() -> Result<(), impl Error> {
     .unwrap();
     let queue = queues.next().unwrap();
 
-    let (mut swapchain, images) = {
-        let surface_capabilities = device
-            .physical_device()
-            .surface_capabilities(&surface, Default::default())
-            .unwrap();
-        let image_format = device
-            .physical_device()
-            .surface_formats(&surface, Default::default())
-            .unwrap()[0]
-            .0;
-
-        Swapchain::new(
-            device.clone(),
-            surface,
-            SwapchainCreateInfo {
-                min_image_count: surface_capabilities.min_image_count.max(2),
-                image_format,
-                image_extent: window.inner_size().into(),
-                image_usage: ImageUsage::COLOR_ATTACHMENT,
-                composite_alpha: surface_capabilities
-                    .supported_composite_alpha
-                    .into_iter()
-                    .next()
-                    .unwrap(),
-                ..Default::default()
-            },
-        )
-        .unwrap()
-    };
-
     let memory_allocator = Arc::new(StandardMemoryAllocator::new_default(device.clone()));
 
     #[derive(BufferContents, Vertex)]
@@ -176,17 +145,15 @@ fn main() -> Result<(), impl Error> {
 
     let vertices = [
         Vertex {
-            position: [-0.5, -0.5],
+            position: [-1., -1.],
         },
         Vertex {
-            position: [-0.5, 0.5],
+            position: [-1., 1.],
         },
         Vertex {
-            position: [0.5, -0.5],
+            position: [1., -1.],
         },
-        Vertex {
-            position: [0.5, 0.5],
-        },
+        Vertex { position: [1., 1.] },
     ];
     let vertex_buffer = Buffer::from_iter(
         memory_allocator.clone(),
@@ -200,23 +167,6 @@ fn main() -> Result<(), impl Error> {
             ..Default::default()
         },
         vertices,
-    )
-    .unwrap();
-
-    let render_pass = vulkano::single_pass_renderpass!(
-        device.clone(),
-        attachments: {
-            color: {
-                format: swapchain.image_format(),
-                samples: 1,
-                load_op: Clear,
-                store_op: Store,
-            },
-        },
-        pass: {
-            color: [color],
-            depth_stencil: {},
-        },
     )
     .unwrap();
 
@@ -242,73 +192,114 @@ fn main() -> Result<(), impl Error> {
 
     // upload any additional buffers, textures here
 
-    let wl_client = WlxClient::new().unwrap();
-    let output_id = *wl_client.outputs.iter().next().unwrap().0;
+    let allow_dmabuf = std::env::args().any(|arg| arg == "--dmabuf");
+    let drm_formats = if !allow_dmabuf {
+        println!("Using SHM capture. To use DMA-buf capture, start with --dmabuf");
+        vec![]
+    } else {
+        println!("Using DMA-buf capture. If the screen is blank for you, switch to SHM by starting without --dmabuf");
 
-    let mut capture = WlrDmabufCapture::new(wl_client, output_id);
-    let rx = capture.init();
+        let possible_formats = [
+            DRM_FORMAT_ABGR8888.into(),
+            DRM_FORMAT_XBGR8888.into(),
+            DRM_FORMAT_ARGB8888.into(),
+            DRM_FORMAT_XRGB8888.into(),
+        ];
+        let mut final_formats = vec![];
+
+        for &f in &possible_formats {
+            let vk_fmt = fourcc_to_vk(f);
+            let Ok(props) = device.physical_device().format_properties(vk_fmt) else {
+                continue;
+            };
+            final_formats.push(DrmFormat {
+                fourcc: f,
+                modifiers: props
+                    .drm_format_modifier_properties
+                    .iter()
+                    // important bit: only allow single-plane
+                    .filter(|m| m.drm_format_modifier_plane_count == 1)
+                    .map(|m| m.drm_format_modifier)
+                    .collect(),
+            })
+        }
+        final_formats
+    };
+
+    //TODO
+    let token: Option<String> = None;
+
+    let screen = futures::executor::block_on(pipewire_select_screen(token.as_deref())).unwrap();
+
+    let name: Arc<str> = format!("wlx-capture-{}", screen.node_id).into();
+
+    let mut capture = PipewireCapture::new(name.clone(), screen.node_id, 60);
+    let rx = capture.init(&drm_formats);
     capture.request_new_frame();
 
-    let view;
+    let mut view;
 
     loop {
-        if let Ok(frame) = rx.try_recv() {
-            match frame {
-                WlxFrame::Dmabuf(frame) => {
-                    let extent = [frame.format.width, frame.format.height, 1];
-                    let format = match frame.format.fourcc.value {
-                        DRM_FORMAT_ABGR8888 => Format::R8G8B8A8_UNORM,
-                        DRM_FORMAT_XBGR8888 => Format::R8G8B8A8_UNORM,
-                        DRM_FORMAT_ARGB8888 => Format::B8G8R8A8_UNORM,
-                        DRM_FORMAT_XRGB8888 => Format::B8G8R8A8_UNORM,
-                        _ => panic!("Unsupported dmabuf format {}", frame.format.fourcc),
-                    };
-
-                    let planes = frame
-                        .planes
-                        .iter()
-                        .take(frame.num_planes)
-                        .filter_map(|plane| {
-                            let Some(fd) = plane.fd else {
-                                return None;
-                            };
-                            Some(SubresourceData {
-                                fd,
-                                offset: plane.offset as _,
-                                row_pitch: plane.stride as _,
-                            })
-                        })
-                        .collect();
-
-                    if let Some(image) = image_from_dma_buf_fd(
-                        &memory_allocator,
-                        device.clone(),
-                        extent,
-                        format,
-                        ImageUsage::SAMPLED | ImageUsage::TRANSFER_SRC,
-                        ImageCreateFlags::empty(),
-                        [queue.queue_family_index()],
-                        planes,
-                        frame.format.modifier,
-                    ) {
-                        view = ImageView::new_default(image).unwrap();
-                        break;
-                    } else {
-                        println!("Failed to create texture from dmabuf");
-                    }
-                }
-                _ => {}
-            }
+        if let Some(new_view) = crate::receiver::try_receive_frame(
+            &rx,
+            device.clone(),
+            queue.clone(),
+            memory_allocator.clone(),
+            command_buffer_allocator.clone(),
+        ) {
+            view = new_view;
+            break;
         }
     }
 
-    let sampler = Sampler::new(
+    let physical_size = PhysicalSize::new(view.image().extent()[0], view.image().extent()[1]);
+    //window.set_min_inner_size(Some(physical_size));
+    //window.set_max_inner_size(Some(physical_size));
+    let _ = window.request_inner_size(physical_size);
+
+    let (mut swapchain, images) = {
+        let surface_capabilities = device
+            .physical_device()
+            .surface_capabilities(&surface, Default::default())
+            .unwrap();
+        let image_format = device
+            .physical_device()
+            .surface_formats(&surface, Default::default())
+            .unwrap()[0]
+            .0;
+
+        Swapchain::new(
+            device.clone(),
+            surface,
+            SwapchainCreateInfo {
+                min_image_count: surface_capabilities.min_image_count.max(2),
+                image_format,
+                image_extent: [physical_size.width, physical_size.height],
+                image_usage: ImageUsage::COLOR_ATTACHMENT,
+                composite_alpha: surface_capabilities
+                    .supported_composite_alpha
+                    .into_iter()
+                    .next()
+                    .unwrap(),
+                ..Default::default()
+            },
+        )
+        .unwrap()
+    };
+
+    let render_pass = vulkano::single_pass_renderpass!(
         device.clone(),
-        SamplerCreateInfo {
-            mag_filter: Filter::Linear,
-            min_filter: Filter::Linear,
-            address_mode: [SamplerAddressMode::Repeat; 3],
-            ..Default::default()
+        attachments: {
+            color: {
+                format: swapchain.image_format(),
+                samples: 1,
+                load_op: Clear,
+                store_op: Store,
+            },
+        },
+        pass: {
+            color: [color],
+            depth_stencil: {},
         },
     )
     .unwrap();
@@ -365,18 +356,6 @@ fn main() -> Result<(), impl Error> {
         )
         .unwrap()
     };
-
-    let layout = &pipeline.layout().set_layouts()[0];
-    let set = DescriptorSet::new(
-        descriptor_set_allocator,
-        layout.clone(),
-        [
-            WriteDescriptorSet::sampler(0, sampler),
-            WriteDescriptorSet::image_view(1, view),
-        ],
-        [],
-    )
-    .unwrap();
 
     let mut viewport = Viewport {
         offset: [0.0, 0.0],
@@ -453,6 +432,40 @@ fn main() -> Result<(), impl Error> {
                 if suboptimal {
                     recreate_swapchain = true;
                 }
+
+                if let Some(new_view) = crate::receiver::try_receive_frame(
+                    &rx,
+                    device.clone(),
+                    queue.clone(),
+                    memory_allocator.clone(),
+                    command_buffer_allocator.clone(),
+                ) {
+                    view = new_view;
+                }
+
+                let sampler = Sampler::new(
+                    device.clone(),
+                    SamplerCreateInfo {
+                        mag_filter: Filter::Linear,
+                        min_filter: Filter::Linear,
+                        address_mode: [SamplerAddressMode::ClampToEdge; 3],
+                        ..Default::default()
+                    },
+                )
+                .unwrap();
+
+                let layout = &pipeline.layout().set_layouts()[0];
+                let set = DescriptorSet::new(
+                    descriptor_set_allocator.clone(),
+                    layout.clone(),
+                    [WriteDescriptorSet::image_view_sampler(
+                        0,
+                        view.clone(),
+                        sampler,
+                    )],
+                    [],
+                )
+                .unwrap();
 
                 let mut builder = RecordingCommandBuffer::new(
                     command_buffer_allocator.clone(),
@@ -557,15 +570,15 @@ fn window_size_dependent_setup(
 mod vs {
     vulkano_shaders::shader! {
         ty: "vertex",
-        src: r"
-            #version 450
+        src: r"#version 310 es
+            precision highp float;
 
             layout(location = 0) in vec2 position;
             layout(location = 0) out vec2 tex_coords;
 
             void main() {
                 gl_Position = vec4(position, 0.0, 1.0);
-                tex_coords = position + vec2(0.5);
+                tex_coords = (position + 1.0) * 0.5;
             }
         ",
     }
@@ -574,17 +587,18 @@ mod vs {
 mod fs {
     vulkano_shaders::shader! {
         ty: "fragment",
-        src: r"
-            #version 450
+        src: r"#version 310 es
+            precision highp float;
 
             layout(location = 0) in vec2 tex_coords;
             layout(location = 0) out vec4 f_color;
 
-            layout(set = 0, binding = 0) uniform sampler s;
-            layout(set = 0, binding = 1) uniform texture2D tex;
+            layout(set = 0, binding = 0) uniform sampler2D in_texture;
 
             void main() {
-                f_color = texture(sampler2D(tex, s), tex_coords);
+                vec4 c = texture(in_texture, tex_coords);
+                f_color.rgb = c.rgb;
+                f_color.a = min((c.r + c.g + c.b)*100.0, 1.0);
             }
         ",
     }
