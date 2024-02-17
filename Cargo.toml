@@ -13,4 +13,4 @@ vulkano-shaders = { git = "https://github.com/vulkano-rs/vulkano", rev = "94f50f
 vulkano-util = { git = "https://github.com/vulkano-rs/vulkano", rev = "94f50f1" }
 vulkano-win = { git = "https://github.com/vulkano-rs/vulkano", rev = "94f50f1" }
 winit = "0.29.10"
-wlx-capture = { git = "https://github.com/galister/wlx-capture" }
+wlx-capture = { git = "https://github.com/galister/wlx-capture", features = ["pipewire"], default-features = false }
