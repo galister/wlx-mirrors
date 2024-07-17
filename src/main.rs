@@ -1,3 +1,4 @@
+use dmabuf::DRM_FORMAT_MOD_INVALID;
 use std::{error::Error, sync::Arc};
 use vulkano::{
     buffer::{Buffer, BufferContents, BufferCreateInfo, BufferUsage},
@@ -44,12 +45,12 @@ use winit::{
     dpi::PhysicalSize,
     event::{Event, WindowEvent},
     event_loop::{ControlFlow, EventLoop},
-    window::WindowBuilder,
+    window::Window,
 };
 use wlx_capture::{
     frame::{
-        DrmFormat, DRM_FORMAT_ABGR8888, DRM_FORMAT_ARGB8888, DRM_FORMAT_XBGR8888,
-        DRM_FORMAT_XRGB8888,
+        DrmFormat, DRM_FORMAT_ABGR2101010, DRM_FORMAT_ABGR8888, DRM_FORMAT_ARGB8888,
+        DRM_FORMAT_XBGR8888, DRM_FORMAT_XRGB8888,
     },
     pipewire::{pipewire_select_screen, PipewireCapture},
     WlxCapture,
@@ -61,6 +62,8 @@ mod dmabuf;
 mod receiver;
 
 fn main() -> Result<(), impl Error> {
+    env_logger::init();
+
     //let layers = vec!["VK_LAYER_KHRONOS_validation".to_owned()];
     let layers = vec![];
 
@@ -79,7 +82,11 @@ fn main() -> Result<(), impl Error> {
     )
     .unwrap();
 
-    let window = Arc::new(WindowBuilder::new().build(&event_loop).unwrap());
+    let window = Arc::new(
+        event_loop
+            .create_window(Window::default_attributes())
+            .unwrap(),
+    );
     let surface = Surface::from_window(instance.clone(), window.clone()).unwrap();
 
     let device_extensions = DeviceExtensions {
@@ -204,15 +211,17 @@ fn main() -> Result<(), impl Error> {
             DRM_FORMAT_XBGR8888.into(),
             DRM_FORMAT_ARGB8888.into(),
             DRM_FORMAT_XRGB8888.into(),
+            DRM_FORMAT_ABGR2101010.into(),
+            DRM_FORMAT_ABGR2101010.into(),
         ];
         let mut final_formats = vec![];
 
         for &f in &possible_formats {
-            let vk_fmt = fourcc_to_vk(f);
+            let vk_fmt = fourcc_to_vk(f).unwrap();
             let Ok(props) = device.physical_device().format_properties(vk_fmt) else {
                 continue;
             };
-            final_formats.push(DrmFormat {
+            let mut fmt = DrmFormat {
                 fourcc: f,
                 modifiers: props
                     .drm_format_modifier_properties
@@ -221,7 +230,9 @@ fn main() -> Result<(), impl Error> {
                     .filter(|m| m.drm_format_modifier_plane_count == 1)
                     .map(|m| m.drm_format_modifier)
                     .collect(),
-            })
+            };
+            fmt.modifiers.push(DRM_FORMAT_MOD_INVALID); // implicit modifiers support
+            final_formats.push(fmt);
         }
         final_formats
     };
@@ -229,25 +240,34 @@ fn main() -> Result<(), impl Error> {
     //TODO
     let token: Option<String> = None;
 
-    let screen = futures::executor::block_on(pipewire_select_screen(token.as_deref())).unwrap();
+    let screen = futures::executor::block_on(pipewire_select_screen(
+        token.as_deref(),
+        true,
+        false,
+        false,
+        false,
+    ))
+    .unwrap();
 
-    let name: Arc<str> = format!("wlx-capture-{}", screen.node_id).into();
+    let stream = screen.streams.first().unwrap();
 
-    let mut capture = PipewireCapture::new(name.clone(), screen.node_id, 60);
-    let rx = capture.init(&drm_formats);
+    let name: Arc<str> = format!("wlx-mirrors-{}", stream.node_id).into();
+
+    let mut capture = PipewireCapture::new(name.clone(), stream.node_id);
+    capture.init(&drm_formats);
     capture.request_new_frame();
 
     let mut view;
 
     loop {
-        if let Some(new_view) = crate::receiver::try_receive_frame(
-            &rx,
+        if let Some(new_image) = crate::receiver::try_receive_frame(
+            &mut capture,
             device.clone(),
             queue.clone(),
             memory_allocator.clone(),
             command_buffer_allocator.clone(),
         ) {
-            view = new_view;
+            view = ImageView::new_default(new_image).unwrap();
             break;
         }
     }
@@ -313,9 +333,7 @@ fn main() -> Result<(), impl Error> {
             .unwrap()
             .entry_point("main")
             .unwrap();
-        let vertex_input_state = Vertex::per_vertex()
-            .definition(&vs.info().input_interface)
-            .unwrap();
+        let vertex_input_state = Vertex::per_vertex().definition(&vs).unwrap();
         let stages = [
             PipelineShaderStageCreateInfo::new(vs),
             PipelineShaderStageCreateInfo::new(fs),
@@ -434,13 +452,13 @@ fn main() -> Result<(), impl Error> {
                 }
 
                 if let Some(new_view) = crate::receiver::try_receive_frame(
-                    &rx,
+                    &mut capture,
                     device.clone(),
                     queue.clone(),
                     memory_allocator.clone(),
                     command_buffer_allocator.clone(),
                 ) {
-                    view = new_view;
+                    view = ImageView::new_default(new_view).unwrap();
                 }
 
                 let sampler = Sampler::new(
